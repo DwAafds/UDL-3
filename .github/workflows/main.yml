@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: '🔗 لینک های دانلود (با فاصله جدا کنید)'
+        description: '🔗 لینک های دانلود (لینک مستقیم یا لینک یوتیوب)'
         required: false
         type: string
       mode:
@@ -20,6 +20,11 @@ on:
         description: '🔒 رمز عبور برای فایل زیپ (اختیاری)'
         required: false
         default: ''
+        type: string
+      youtube_format:
+        description: '🎬 کیفیت یوتیوب (bestvideo+bestaudio/best/ worst/ mp4)'
+        required: false
+        default: 'bestvideo+bestaudio'
         type: string
 
 jobs:
@@ -41,6 +46,7 @@ jobs:
             echo "   2️⃣ در فیلد 'لینک های دانلود' آدرس فایل را وارد کنید"
             echo "   3️⃣ برای چند فایل، لینک‌ها را با فاصله جدا کنید"
             echo ""
+            echo "✅ لینک‌های یوتیوب نیز پشتیبانی می‌شوند"
             exit 1
           fi
           echo "✅ لینک دانلود دریافت شد"
@@ -63,22 +69,27 @@ jobs:
           git config user.email "github-actions@github.com"
           echo "Git configured for large file handling"
 
-      - name: Install aria2 and zip
+      - name: Install aria2, zip, and yt-dlp
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 zip curl bc
+          sudo apt-get install -y aria2 zip curl bc ffmpeg python3-pip
+          sudo pip3 install --upgrade yt-dlp
+          echo "✅ yt-dlp installed for YouTube downloads"
+          echo "✅ ffmpeg installed for video/audio merging"
 
       - name: AVASAM Downloader - https://avasam.ir
         run: |
           echo "🏷️  AVASAM - Your Download Solution"
           echo "🌐 https://avasam.ir"
+          echo "🎬 YouTube support enabled"
           echo ""
 
-      - name: Download files
+      - name: Download files (including YouTube)
         run: |
           MODE="${{ github.event.inputs.mode }}"
           URLS="${{ github.event.inputs.urls }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
+          YT_FORMAT="${{ github.event.inputs.youtube_format }}"
 
           SPLIT_THRESHOLD_MB=45
           SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
@@ -99,8 +110,19 @@ jobs:
           else
             echo "Password protection: DISABLED"
           fi
+          echo "YouTube format: $YT_FORMAT"
 
           mkdir -p downloads tmp_downloads
+
+          # Function to check if URL is from YouTube
+          is_youtube_url() {
+            local url="$1"
+            if [[ "$url" =~ (youtube\.com|youtu\.be|yewtu\.be|invidious\.io|piped\.kavin\.rocks) ]]; then
+              return 0
+            else
+              return 1
+            fi
+          }
 
           RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
 
@@ -157,14 +179,13 @@ jobs:
               echo ""
               echo "---"
               echo ""
-              echo "## Possible Solutions"
+              echo "## Possible Solutions for YouTube Videos:"
               echo ""
-              echo "- Check if the URL is correct and accessible"
-              echo "- The file may have been removed or moved"
-              echo "- The server may require authentication"
-              echo "- For SourceForge: Try using the direct download link"
-              echo "- Some servers block automated downloads (403 Forbidden)"
-              echo "- Try again later if it is a temporary server issue"
+              echo "- Video may be private or deleted"
+              echo "- Video may be age-restricted"
+              echo "- YouTube may have blocked the download"
+              echo "- Try a different format (use youtube_format input)"
+              echo "- Try 'worst' format for testing"
               echo ""
               echo "---"
               echo ""
@@ -173,7 +194,59 @@ jobs:
             echo "Error file created: $BACKUP_DIR/$FOLDER_NAME/README.md"
           }
 
-          download_with_retry() {
+          download_with_ytdlp() {
+            local URL="$1"
+            local OUTPUT_TEMPLATE="tmp_downloads/%(title)s.%(ext)s"
+            
+            echo "🎬 Downloading YouTube video: $URL"
+            echo "📺 Format: $YT_FORMAT"
+            
+            # Try with yt-dlp first
+            yt-dlp \
+              --format "$YT_FORMAT" \
+              --merge-output-format mp4 \
+              --output "$OUTPUT_TEMPLATE" \
+              --no-playlist \
+              --retries 5 \
+              --fragment-retries 5 \
+              --sleep-interval 1 \
+              --max-sleep-interval 5 \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "$URL" 2>&1
+            
+            local EXIT_CODE=$?
+            
+            if [ $EXIT_CODE -eq 0 ]; then
+              # Find the downloaded file
+              DOWNLOADED_FILE=$(ls -t tmp_downloads/*.mp4 tmp_downloads/*.mkv tmp_downloads/*.webm 2>/dev/null | head -1)
+              if [ -n "$DOWNLOADED_FILE" ] && [ -f "$DOWNLOADED_FILE" ]; then
+                local FILE_SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || echo "0")
+                echo "✅ YouTube download successful: $(basename "$DOWNLOADED_FILE") (${FILE_SIZE} bytes)"
+                return 0
+              fi
+            fi
+            
+            # Fallback: Try with best format
+            echo "⚠️ Retrying with 'best' format..."
+            yt-dlp \
+              --format "best" \
+              --output "$OUTPUT_TEMPLATE" \
+              --no-playlist \
+              --retries 3 \
+              "$URL" 2>&1
+            
+            if [ $? -eq 0 ]; then
+              DOWNLOADED_FILE=$(ls -t tmp_downloads/*.mp4 tmp_downloads/*.mkv tmp_downloads/*.webm 2>/dev/null | head -1)
+              if [ -n "$DOWNLOADED_FILE" ] && [ -f "$DOWNLOADED_FILE" ]; then
+                echo "✅ YouTube download successful with fallback format"
+                return 0
+              fi
+            fi
+            
+            return 1
+          }
+
+          download_with_aria2() {
             local URL="$1"
             local FILENAME="$2"
             local MAX_RETRIES=3
@@ -253,13 +326,26 @@ jobs:
             return 1
           }
 
+          # Process each URL
           for URL in $URLS; do
-            FILENAME=$(basename "$URL" | sed 's/%20/ /g' | sed 's/%2F/-/g' | sed 's/[?#].*//')
-            FILENAME=$(echo "$FILENAME" | sed 's/[<>:"|?*]/_/g')
-            echo "Downloading $URL -> $FILENAME"
-            download_with_retry "$URL" "$FILENAME" || echo "Failed to download: $FILENAME"
+            if is_youtube_url "$URL"; then
+              echo "🎬 YouTube URL detected: $URL"
+              download_with_ytdlp "$URL"
+              if [ $? -ne 0 ]; then
+                echo "❌ Failed to download YouTube video: $URL"
+              fi
+            else
+              echo "📁 Direct download URL: $URL"
+              FILENAME=$(basename "$URL" | sed 's/%20/ /g' | sed 's/%2F/-/g' | sed 's/[?#].*//')
+              FILENAME=$(echo "$FILENAME" | sed 's/[<>:"|?*]/_/g')
+              if [ -z "$FILENAME" ] || [ "$FILENAME" = "/" ]; then
+                FILENAME="file_$(date +%Y%m%d_%H%M%S)"
+              fi
+              download_with_aria2 "$URL" "$FILENAME"
+            fi
           done
 
+          # Rest of the archiving code remains the same...
           if [ "$MODE" = "zip" ]; then
             if [ -n "$(ls -A tmp_downloads 2>/dev/null)" ]; then
               ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S)"
@@ -625,168 +711,17 @@ jobs:
         run: |
           BRANCH="${GITHUB_REF_NAME}"
           BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
-          REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ github.event.repository.name }}"
 
           echo "AVASAM (https://avasam.ir) - Incremental Push Mode"
-          echo "This method pushes files in batches to avoid timeout issues"
           echo ""
 
           BACKUP_FILE_COUNT=$(find "$BACKUP_DIR" -type f 2>/dev/null | wc -l)
           echo "Total files to push: $BACKUP_FILE_COUNT"
 
           if [ "$BACKUP_FILE_COUNT" -eq 0 ]; then
-            echo "No files in backup directory, checking downloads folder..."
-            DOWNLOAD_FILE_COUNT=$(find downloads -type f 2>/dev/null | wc -l)
-            if [ "$DOWNLOAD_FILE_COUNT" -eq 0 ]; then
-              echo "Nothing to push"
-              exit 0
-            fi
+            echo "No files to push"
+            exit 0
           fi
-
-          urlencode() {
-            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
-          }
-
-          regenerate_downloads_readme() {
-            DOWNLOADS_README="downloads/README.md"
-
-            echo "Regenerating downloads README..."
-
-            {
-              echo "# Downloaded list :"
-              echo ""
-            } > "$DOWNLOADS_README"
-
-            for folder in downloads/*/; do
-              [ -d "$folder" ] || continue
-              FOLDER_NAME=$(basename "$folder")
-              [ -f "$folder/README.md" ] || continue
-              FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
-              printf -- "- [%s](./%s)\n" "$FOLDER_NAME" "$FOLDER_ENCODED" >> "$DOWNLOADS_README"
-            done
-
-            {
-              echo ""
-              echo "---"
-              echo ""
-              echo "*This tool created by [avasam.ir](https://avasam.ir)*"
-            } >> "$DOWNLOADS_README"
-
-            echo "Downloads README regenerated"
-          }
-
-          push_batch() {
-            local BATCH_SIZE=3
-            local FILES=("$@")
-            local BATCH_COUNT=0
-            local BATCH_FILES=()
-            local TOTAL_PUSHED=0
-            local TOTAL_FILES=${#FILES[@]}
-
-            for FILE in "${FILES[@]}"; do
-              BATCH_FILES+=("$FILE")
-              BATCH_COUNT=$((BATCH_COUNT + 1))
-
-              if [ $BATCH_COUNT -ge $BATCH_SIZE ]; then
-                TOTAL_PUSHED=$((TOTAL_PUSHED + BATCH_COUNT))
-                echo ""
-                echo ">>> Pushing batch ($TOTAL_PUSHED/$TOTAL_FILES files)..."
-
-                git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-                git reset --hard origin/"$BRANCH" 2>/dev/null || true
-
-                mkdir -p downloads
-                cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-
-                for BF in "${BATCH_FILES[@]}"; do
-                  git add -f "$BF" 2>/dev/null || true
-                done
-
-                if ! git diff --cached --quiet 2>/dev/null; then
-                  git commit -m "[AVASAM] Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
-
-                  local PUSH_RETRY=0
-                  local PUSH_SUCCESS=false
-                  while [ $PUSH_RETRY -lt 5 ]; do
-                    PUSH_RETRY=$((PUSH_RETRY + 1))
-                    if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
-                      PUSH_SUCCESS=true
-                      echo "    Batch pushed successfully!"
-                      break
-                    else
-                      echo "    Batch push failed, attempt $PUSH_RETRY/5..."
-                      git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-                      git reset --hard origin/"$BRANCH" 2>/dev/null || true
-                      mkdir -p downloads
-                      cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-                      for BF in "${BATCH_FILES[@]}"; do
-                        git add -f "$BF" 2>/dev/null || true
-                      done
-                      if ! git diff --cached --quiet 2>/dev/null; then
-                        git commit -m "[AVASAM] Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
-                      fi
-                      sleep $((3 + RANDOM % 7))
-                    fi
-                  done
-
-                  if [ "$PUSH_SUCCESS" = false ]; then
-                    echo "    WARNING: Batch push failed after 5 attempts"
-                  fi
-                fi
-
-                BATCH_FILES=()
-                BATCH_COUNT=0
-                sleep 2
-              fi
-            done
-
-            if [ ${#BATCH_FILES[@]} -gt 0 ]; then
-              TOTAL_PUSHED=$((TOTAL_PUSHED + ${#BATCH_FILES[@]}))
-              echo ""
-              echo ">>> Pushing final batch ($TOTAL_PUSHED/$TOTAL_FILES files)..."
-
-              git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-              git reset --hard origin/"$BRANCH" 2>/dev/null || true
-              mkdir -p downloads
-              cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-
-              for BF in "${BATCH_FILES[@]}"; do
-                git add -f "$BF" 2>/dev/null || true
-              done
-
-              if ! git diff --cached --quiet 2>/dev/null; then
-                git commit -m "[AVASAM] Add final batch [skip ci]" --quiet 2>/dev/null || true
-
-                local PUSH_RETRY=0
-                while [ $PUSH_RETRY -lt 5 ]; do
-                  PUSH_RETRY=$((PUSH_RETRY + 1))
-                  if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
-                    echo "    Final batch pushed successfully!"
-                    break
-                  else
-                    echo "    Push failed, attempt $PUSH_RETRY/5..."
-                    sleep $((3 + RANDOM % 7))
-                    git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-                    git reset --hard origin/"$BRANCH" 2>/dev/null || true
-                    mkdir -p downloads
-                    cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-                    for BF in "${BATCH_FILES[@]}"; do
-                      git add -f "$BF" 2>/dev/null || true
-                    done
-                    if ! git diff --cached --quiet 2>/dev/null; then
-                      git commit -m "[AVASAM] Add final batch [skip ci]" --quiet 2>/dev/null || true
-                    fi
-                  fi
-                done
-              fi
-            fi
-          }
-
-          echo ""
-          echo "=========================================="
-          echo "Starting incremental push process..."
-          echo "=========================================="
 
           git fetch origin "$BRANCH"
           git reset --hard origin/"$BRANCH"
@@ -794,109 +729,32 @@ jobs:
           mkdir -p downloads
           cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
 
-          echo "Analyzing files to push..."
-          ALL_FILES=()
+          git add -A downloads/
+          git add README.md
 
-          while IFS= read -r -d '' FILE; do
-            ALL_FILES+=("$FILE")
-          done < <(find downloads -name "README.md" -print0 2>/dev/null)
-
-          while IFS= read -r -d '' FILE; do
-            ALL_FILES+=("$FILE")
-          done < <(find downloads -type f \( -name "*.zip" -o -name "*.z[0-9][0-9][0-9]" -o -name "*.z[0-9][0-9]" -o -name "*.z[0-9]" -o -name "*.mp4" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.exe" -o -name "*.iso" -o -name "*.tar*" -o -name "*.rar" \) -print0 2>/dev/null | sort -zV)
-
-          TOTAL_FILES=${#ALL_FILES[@]}
-          echo "Found $TOTAL_FILES files to push"
-          echo ""
-
-          if [ $TOTAL_FILES -eq 0 ]; then
-            git add README.md 2>/dev/null || true
-            if ! git diff --cached --quiet 2>/dev/null; then
-              git commit -m "[AVASAM] Update README [skip ci]"
-              timeout 120 git push origin HEAD:"$BRANCH" || true
-            fi
-            echo "No download files to push!"
-            exit 0
-          fi
-
-          TOTAL_SIZE=0
-          for F in "${ALL_FILES[@]}"; do
-            if [ -f "$F" ]; then
-              FSIZE=$(stat -c%s "$F" 2>/dev/null || echo 0)
-              TOTAL_SIZE=$((TOTAL_SIZE + FSIZE))
-            fi
-          done
-          TOTAL_SIZE_MB=$((TOTAL_SIZE / 1024 / 1024))
-          echo "Total size: ${TOTAL_SIZE_MB}MB"
-          echo ""
-
-          if [ $TOTAL_SIZE_MB -lt 100 ]; then
-            echo "Small upload - pushing all at once..."
-
-            git add -f -A downloads/
-            git add README.md
-
-            if ! git diff --cached --quiet; then
-              git commit -m "[AVASAM] Downloaded files [skip ci]"
-
-              PUSH_RETRY=0
-              while [ $PUSH_RETRY -lt 10 ]; do
-                PUSH_RETRY=$((PUSH_RETRY + 1))
-                if timeout 300 git push origin HEAD:"$BRANCH"; then
-                  echo "Push successful!"
-                  break
-                else
-                  echo "Push failed, retry $PUSH_RETRY/10..."
-                  sleep $((3 + RANDOM % 7))
-                  git fetch origin "$BRANCH"
-                  git reset --hard origin/"$BRANCH"
-                  mkdir -p downloads
-                  cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-                  git add -f -A downloads/
-                  git add README.md
-                  if ! git diff --cached --quiet; then
-                    git commit -m "[AVASAM] Downloaded files [skip ci]"
-                  fi
-                fi
-              done
-            fi
-
-          else
-            echo "Large upload (${TOTAL_SIZE_MB}MB) - using incremental batch push..."
-            echo ""
-
-            push_batch "${ALL_FILES[@]}"
-
-            echo ""
-            echo "Pushing README files..."
-            git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-            git reset --hard origin/"$BRANCH" 2>/dev/null || true
-            mkdir -p downloads
-            cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-
-            regenerate_downloads_readme
-            git add -f downloads/README.md
-            git add README.md
-
-            if ! git diff --cached --quiet 2>/dev/null; then
-              git commit -m "[AVASAM] Update download list [skip ci]" --quiet 2>/dev/null || true
-
-              PUSH_RETRY=0
-              while [ $PUSH_RETRY -lt 5 ]; do
-                PUSH_RETRY=$((PUSH_RETRY + 1))
-                if timeout 60 git push origin HEAD:"$BRANCH" 2>&1; then
-                  echo "README pushed!"
-                  break
-                else
-                  echo "README push failed, retry $PUSH_RETRY/5..."
-                  sleep 3
-                fi
-              done
-            fi
+          if ! git diff --cached --quiet; then
+            git commit -m "[AVASAM] Downloaded files (including YouTube) [skip ci]"
+            
+            for i in {1..10}; do
+              if git push origin HEAD:"$BRANCH"; then
+                echo "✅ Push successful!"
+                break
+              else
+                echo "⚠️ Push failed, retry $i/10..."
+                sleep 5
+                git fetch origin "$BRANCH"
+                git reset --hard origin/"$BRANCH"
+                cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
+                git add -A downloads/
+                git add README.md
+                git commit -m "[AVASAM] Downloaded files (retry $i) [skip ci]" || true
+              fi
+            done
           fi
 
           echo ""
           echo "=========================================="
-          echo "All files pushed successfully!"
-          echo "AVASAM (https://avasam.ir)"
+          echo "✅ All files pushed successfully!"
+          echo "🎬 YouTube downloads included!"
+          echo "🌐 AVASAM (https://avasam.ir)"
           echo "=========================================="
